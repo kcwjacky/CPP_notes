@@ -458,3 +458,102 @@ int main() {
     for (auto& t : threads) t.join();
 }
 ```
+
+## C++ 的記憶體模型
+
+以上都是 C++ 多執行緒的基本操作，接下來是另外一個世界...
+
+### 記憶體的同步
+
+* 一個程式可以包含一個或多個執行緒 (thread of execution)
+* 不同執行緒如果存取同樣記憶體位址的物件，在沒有進行同步 (synchronized-with) 的狀況下，是未定義行為 (undefined behavior)
+* 可以使用 std::mutex 或 std::atomic<T> 來進行同步
+
+用前面 `std::call_once` 的例子來說明記憶體之間的同步
+
+```cpp
+// 有 10 個 threads，但只要一個 thread 替 result 做初始化
+int main() {
+    int result;
+    bool initialized = false;
+    std::mutex m;
+    std::vector<std::thread> threads;
+    for (int k = 0; k < 10; ++k) {
+        threads.push_back(
+            std::thread([&, k]() {
+                if (!initialized) {
+                    std::lock_guard l(m);
+                    if (!initialized) {
+                        // 雙重檢查鎖 (double-checked locking) 
+                        // 來防止 initialized 變數發生 race condition
+                        result = 0;
+                        initialized = true;
+                    }
+                }
+                std::cout << result;
+            }));
+    }
+    for (auto& t : threads) t.join();
+    std::cout << result << std::endl;
+}
+```
+
+以上的程式碼會有問題，因為 `result` 與 `initialized` 在不同的執行緒是沒有進行同步的。例如：threads[0] 執行完 `initialized = true;` 的同時 threads[1] 執行到 `if (!initialized)`，其中 thread[1] 此時的 `initialized` 可能還是 `false`，因為尚未被同步 (各別還在用各自 cache 內的值)。此時我們可以使用 `lock` 與 `unlock` 把 `result` 與 `initialized` 包起來，其會替我們自動完成記憶體的同步，因為 `unlock` 會將使用到的資源更新到主記憶體上，`lock` 則是會從主記憶體去下載最新的資源下來，像是 C 語言當中的 `volatile`。或是直接使用 `std::call_once` 而不要自己寫同步。
+
+以下為 C++ 記憶體同步所需要的功能：
+* acquire
+  * 用來取得最新記憶體的更新
+  * 在 acquire 之後，其它執行緒替共享的資源做的更新，C++ 並不保證你會看到。
+  * `mutex.lock();` 的實作中有替我們做了 acquire
+* release
+  * 用來發布到目前為止的記憶體更新
+  * release 之後，其它執行緒也不一定會自動取得發布的最新狀態，其它執行緒必須要執行 acquire 才能取得
+  * `mutex.unlock();` 的實作中有替我們做了 release
+* relaxed
+  * release 會發布所有與其他 threads 所共享物件的記憶體狀態，這樣的做法有時會缺乏效率。所以用 relaxed 可以只同步一個物件記憶體狀態
+
+### Memory order
+
+memory_order 為一個列舉類別用於標示原子操作中記憶體存取的一些重要特性。
+
+順序一致性：sequentially consistent，保證所有執行緒修改的順序都一樣
+
+``` cpp
+typedef enum memory_order {
+    memory_order_relaxed,
+    memory_order_consume,
+    memory_order_acquire,
+    memory_order_release,
+    memory_order_acq_rel,
+    memory_order_seq_cst
+} memory_order;
+```
+
+超難！待整理，好像反正不會用到 XD
+
+## Atomic operation
+* atomic 表示 thread-safe
+* atomic 的物件無法複製也無法移動，只能參考
+* 只有 atomic_flag 一定是無鎖的 (lock-free)，其它如 `template<class T> class atomic<T>` 在操作時，內部可能還是有 lock/unlock 的動作
+
+```cpp
+// 用 atomic 練習實作 lock
+class Mutex {
+    std::atomic<bool> flag_{false};
+public:
+    void Lock() {
+        /*
+        while (flag_.load() == true);
+        flag_.store(true);
+        這寫法會有 race condition，兩行指令中間可能會有其他執行緒見縫插針
+        解決方法為使用一個指令來完成兩個指令的工作
+        例如 old_val = flag_.exchange(new_val);
+        */
+        while (flag_.exchange(true));
+        flag_.store(true);
+    }
+    void Unlock() {
+        flag_.store(false);
+    }
+}
+```
