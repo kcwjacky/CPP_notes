@@ -557,3 +557,159 @@ public:
     }
 }
 ```
+
+## Quicksort
+
+### 基本版本
+```cpp
+#include <iostream>
+#include <vector>
+#include <random>
+#include <chrono>
+#include <future>
+
+void QuickSort(std::vector<unsigned int>& nums, size_t start, size_t stop) {
+    if (start == stop) return;
+    size_t j = start + 1;
+    for (size_t i = start + 1; i < stop; i++) {
+        if (nums[i] < nums[start]) {
+            std::swap(nums[i], nums[j]);
+            j++;
+        }
+    }
+    size_t mid = j - 1;
+    std::swap(nums[start], nums[mid]);
+    
+    QuickSort(nums, start, mid);
+    QuickSort(nums, mid + 1, stop);
+}
+
+void QuickSort(std::vector<unsigned int>& nums) {
+    QuickSort(nums, 0, nums.size());
+}
+
+int main() {
+    std::mt19937 mt{0};
+    std::vector<unsigned int> values;
+    for (size_t i = 0; i < 100000; ++i) {
+        values.push_back(mt());
+    }
+    auto start = std::chrono::steady_clock::now();
+    QuickSort(values);
+    auto end = std::chrono::steady_clock::now();
+    std::cout << (end - start) << std::endl;
+}
+```
+
+### 並行版本 
+設計並實作一個執行緒安全的佇列，將工作分成多個固定份量的任務，並放到佇列中等待執行，每個執行緒在完成一個任務後會自動繼續從佇列中提取下一個任務來執行，直到沒有任何任務為止。(固定模式使用 producer 與 consumer)
+
+```cpp
+#include <vector>
+#include <deque>
+#include <iostream>
+#include <thread>
+#include <random>
+#include <condition_variable>
+#include <chrono>
+
+template<typename T>
+class Queue {
+    std::deque<T> d_;
+    std::mutex m_;
+    size_t remaining_{0};
+    std::atomic<bool> is_closed_{false};
+    std::condition_variable cond_;
+public:
+    void Enqueue(T value) { 
+        std::lock_guard lk(m_);
+        remaining_++;
+        d_.push_back(value);
+        cond_.notify_one();
+    }
+    void Done() {
+        std::lock_guard lk(m_);
+        remaining_--;
+        if (remaining_ == 0) {
+            cond_.notify_all();
+        }
+    }
+    void Close() {
+        is_closed_ = true;
+        cond_.notify_all();
+    }
+    bool WaitAndDequeue(T& value) { 
+        while (true) {
+            std::unique_lock lk(m_);
+            cond_.wait(lk, [&]() { return !d_.empty() || (remaining_ == 0 && is_closed_); });
+            if (remaining_ == 0 && is_closed_) return false;
+            value = d_.front();
+            d_.pop_front();
+            return true;
+        }
+    }
+};
+
+struct Job {
+    size_t start;
+    size_t stop;
+};
+
+void QuickSort(Queue<Job>& jobs, std::vector<unsigned int>& nums, 
+               size_t start, size_t stop) {
+    if (start == stop) return;
+    size_t j = start + 1;
+    for (size_t i = start + 1; i < stop; i++) {
+        if (nums[i] < nums[start]) {
+            std::swap(nums[i], nums[j]);
+            j++;
+        }
+    }
+    size_t mid = j - 1;
+    std::swap(nums[start], nums[mid]);
+    
+    if (mid - start > 10000) {
+        jobs.Enqueue({start, mid});         // 當任務有一定負擔時才塞到 queue
+    } else {
+        QuickSort(jobs, nums, start, mid);  // 反之，直接做掉反而省掉 overhead
+    }
+    QuickSort(jobs, nums, mid + 1, stop);   // 若同時有兩個任務時，只需要一個塞到 queue 就好
+                                            // 當前執行緒本身就可以負責一個任務
+}
+
+int main() {
+    std::mt19937 mt{0};
+    std::vector<unsigned int> values;
+    for (size_t i = 0; i < 100000000; ++i) {
+        values.push_back(mt());
+    }
+    Queue<Job> jobs;
+    auto start = std::chrono::steady_clock::now();
+    {
+        int number_of_workers = 8;
+        std::vector<std::jthread> workers(number_of_workers);
+                
+        for (int w = 0; w < number_of_workers; ++w) {
+            workers[w] = std::jthread([&jobs, &values]() {
+                Job job;
+                while (jobs.WaitAndDequeue(job)) {
+                    QuickSort(jobs, values, job.start, job.stop);
+                    jobs.Done();
+                }
+            });
+        }
+
+        jobs.Enqueue({0, values.size()});
+        jobs.Close();
+    }
+    auto end = std::chrono::steady_clock::now();
+    std::cout << (end - start) << std::endl;
+    
+    for (size_t i = 0; i + 1 < values.size(); ++i) {
+        if (values[i] > values[i + 1]) {
+            std::cout << "ERROR" << std::endl;
+            break;
+        }
+    }
+}
+```
